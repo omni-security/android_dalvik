@@ -41,6 +41,10 @@
 #include <sys/utsname.h>
 #include <sys/capability.h>
 
+#ifdef HAVE_ANDROID_OS
+#include "fd_utils-inl.h"
+#endif
+
 #if defined(HAVE_PRCTL)
 # include <sys/prctl.h>
 #endif
@@ -523,6 +527,11 @@ static void detachDescriptors(ArrayObject* fdsToClose) {
 
 #endif
 
+#ifdef HAVE_ANDROID_OS
+// The list of open zygote file descriptors.
+static FileDescriptorTable* gOpenFdTable = NULL;
+#endif
+
 /*
  * Utility routine to fork zygote and specialize the child process.
  */
@@ -590,6 +599,27 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer, bool l
     setSignalHandler();
 
     dvmDumpLoaderStats("zygote");
+
+    // Close any logging related FDs before we start evaluating the list of
+    // file descriptors.
+    __android_log_close();
+
+#ifdef HAVE_ANDROID_OS
+    // If this is the first fork for this zygote, create the open FD table.
+    // If it isn't, we just need to check whether the list of open files
+    // has changed (and it shouldn't in the normal case).
+    if (gOpenFdTable == NULL) {
+        gOpenFdTable = FileDescriptorTable::Create();
+        if (gOpenFdTable == NULL) {
+            ALOGE("Unable to construct file descriptor table.");
+            dvmAbort();
+        }
+    } else if (!gOpenFdTable->Restat()) {
+        ALOGE("Unable to restat file descriptor table.");
+        dvmAbort();
+    }
+#endif
+
     pid = fork();
 
     if (pid == 0) {
@@ -629,6 +659,12 @@ static pid_t forkAndSpecializeCommon(const u4* args, bool isSystemServer, bool l
             }
         }
 
+        // Re-open all remaining open file descriptors so that they aren't
+        // shared with the zygote across a fork.
+        if (!gOpenFdTable->ReopenOrDetach()) {
+            ALOGE("Unable to reopen whitelisted descriptors.");
+            dvmAbort();
+        }
 #endif /* HAVE_ANDROID_OS */
 
         if (mountMode != MOUNT_EXTERNAL_NONE) {
